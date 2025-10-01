@@ -1,2 +1,9 @@
-# astrbot_plugin_owcx
-亚服《守望先锋 2》战绩查询（支持绑定战网 Tag）
+# helloworld
+
+AstrBot 插件模板
+
+A template plugin for AstrBot plugin feature
+
+# 支持
+
+[帮助文档](https://astrbot.app)
