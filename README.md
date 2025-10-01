@@ -1,9 +1,9 @@
 # helloworld
 
-AstrBot 插件模板
+AstrBot 守望先锋亚服战绩查询插件
 
-A template plugin for AstrBot plugin feature
+特别简陋，而且大概率无法有后续更新
 
 # 支持
 
-[帮助文档](https://astrbot.app)
+来玩守望吗？+q群710574642

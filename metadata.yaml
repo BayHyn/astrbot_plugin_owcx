@@ -1,5 +1,5 @@
-name: ow_stats
+name: astrbot_plugin_owcx
 desc: 亚服《守望先锋 2》战绩查询（支持绑定战网 Tag）
 version: v1.0.0
-author: YourName
+author: tzyc
 repo: https://github.com/TZYCeng/astrbot_plugin_owcx
