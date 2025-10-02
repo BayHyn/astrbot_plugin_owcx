@@ -315,7 +315,7 @@ class OWStatsPlugin(Star):
             f"🔧 插件状态\n"
             f"API 连通: {'✅' if ok else '❌'}\n"
             f"已绑定: {total} 人\n"
-            f"版本: v6.1.0"
+            f"版本: v1.1.0"
         )
 
     async def terminate(self):
