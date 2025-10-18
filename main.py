@@ -1,4 +1,3 @@
-# main.py  –  AstrBot 亚服 OW2 战绩查询
 from astrbot.api.star import Star, register
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api import logger
@@ -105,14 +104,14 @@ class OWAPIClient:
                 logger.warning(f"[OWAPI] 请求超时（尝试{attempt}）| url={url}")
             except Exception as e:
                 logger.error(f"[OWAPI] 请求异常（尝试{attempt}）: {type(e).__name__}: {e} | url={url}")
-            backoff = 2 ** attempt
+            backoff = 2 **attempt
             if time.time() + backoff >= deadline:
                 logger.warning("[OWAPI] 剩余时间不足，放弃重试")
                 break
             await asyncio.sleep(backoff)
         return None
 
-    # 五个原子接口
+    # 核心接口
     async def get_summary(self, tag: str) -> Optional[Dict[str, Any]]:
         url = f"{OW_API}/players/{tag.replace('#', '-')}/summary"
         return await self._get(url, timeout=8)
@@ -121,16 +120,8 @@ class OWAPIClient:
         url = f"{OW_API}/players/{tag.replace('#', '-')}/stats/summary?gamemode=competitive"
         return await self._get(url, timeout=10, silent=True)
 
-    async def get_comp_heroes(self, tag: str) -> Optional[Dict[str, Any]]:
-        url = f"{OW_API}/players/{tag.replace('#', '-')}/stats/heroes?gamemode=competitive"
-        return await self._get(url, timeout=10, silent=True)
-
     async def get_qp_summary(self, tag: str) -> Optional[Dict[str, Any]]:
         url = f"{OW_API}/players/{tag.replace('#', '-')}/stats/summary?gamemode=quickplay"
-        return await self._get(url, timeout=10, silent=True)
-
-    async def get_qp_heroes(self, tag: str) -> Optional[Dict[str, Any]]:
-        url = f"{OW_API}/players/{tag.replace('#', '-')}/stats/heroes?gamemode=quickplay"
         return await self._get(url, timeout=10, silent=True)
 
 
@@ -141,21 +132,25 @@ DIVISION_CN = {
     "grandmaster": "宗师"
 }
 
+# 角色名中英文映射（核心修改1）
+ROLE_CN = {
+    "tank": "坦克",
+    "damage": "输出",
+    "support": "支援"
+}
+
 def div_to_sr(div: Optional[str], tier: Optional[int]) -> str:
     if not div or tier is None:
-        return "未定位"
+        return "未定级"  # 核心修改2：未定级时明确显示
     cn = DIVISION_CN.get(div, div.upper())
     return f"{cn} {tier}"
-
-def pick_top_heroes(heroes_list: List[Dict[str, Any]], n: int = 5) -> List[Dict[str, Any]]:
-    heroes_list.sort(key=lambda x: x.get("time_played", 0), reverse=True)
-    return heroes_list[:n]
 
 def fmt_duration(sec: int) -> str:
     h, m = divmod(sec // 60, 60)
     return f"{h}h{m}m"
 
-def format_mode(general: Dict[str, Any], heroes: List[Dict[str, Any]], mode_name: str) -> str:
+# 模式数据格式化
+def format_mode(general: Dict[str, Any], mode_name: str) -> str:
     gp = general.get("games_played", 0)
     gw = general.get("games_won", 0)
     gl = gp - gw
@@ -167,30 +162,18 @@ def format_mode(general: Dict[str, Any], heroes: List[Dict[str, Any]], mode_name
     dmg_avg = avg.get("damage", 0)
     heal_avg = avg.get("healing", 0)
 
-    top = pick_top_heroes(heroes)
-    hero_lines = []
-    for h in top:
-        name = h["key"].capitalize()
-        wr_h = h.get("winrate", 0)
-        kt = h.get("time_played", 0)
-        kda_h = h.get("kda", 0)
-        hero_lines.append(
-            f"{name}  胜率{wr_h:.1f}%  时长{fmt_duration(kt)}  KD{kda_h:.2f}"
-        )
-
     return (
         f"【{mode_name}】\n"
         f"📊 总场次 {gp}  胜 {gw}  负 {gl}  胜率 {wr:.1f}%  综合KD {kd:.2f}\n"
         f"🎯 平均数据（每10min）\n"
         f"　消灭 {elim_avg:.1f}  死亡 {death_avg:.1f}  "
-        f"伤害 {dmg_avg:.0f}  治疗 {heal_avg:.0f}\n"
-        f"🎮 常玩英雄 TOP5\n" + ("\n".join(hero_lines) if hero_lines else "　暂无数据")
+        f"伤害 {dmg_avg:.0f}  治疗 {heal_avg:.0f}"
     )
 
 
-@register("astrbot_plugin_owcx", "tzyc", "亚服 OW2 全数据查询", "v1.1.0")
+@register("astrbot_plugin_owcx", "tzyc", "亚服 OW2 全数据查询", "v1.1.1")
 class OWStatsPlugin(Star):
-    def __init__(self, **kwargs):
+    def __init__(self,** kwargs):
         super().__init__(kwargs.get("context"))
         self.client = OWAPIClient()
         self.bind_file = Path("data/ow_stats_bind.json")
@@ -212,7 +195,7 @@ class OWStatsPlugin(Star):
         except Exception as e:
             logger.error(f"保存绑定失败: {e}")
 
-    # ---- 命令 ----
+    # ---- 命令（核心修改：角色名中文 + 强制显示所有角色）----
     @filter.command("ow")
     async def ow_stats(self, event: AstrMessageEvent):
         arg = event.message_str.strip().removeprefix("ow").strip()
@@ -227,53 +210,77 @@ class OWStatsPlugin(Star):
 
         yield event.plain_result(f"正在查询 {tag} ...")
 
-        async def gather_all():
-            return await asyncio.gather(
-                self.client.get_summary(tag),
-                self.client.get_comp_summary(tag),
-                self.client.get_comp_heroes(tag),
-                self.client.get_qp_summary(tag),
-                self.client.get_qp_heroes(tag)
-            )
+        try:
+            summary_task = self.client.get_summary(tag)
+            comp_sum_task = self.client.get_comp_summary(tag)
+            qp_sum_task = self.client.get_qp_summary(tag)
+            summary, comp_sum, qp_sum = await asyncio.gather(summary_task, comp_sum_task, qp_sum_task)
 
-        summary, comp_sum, comp_hero, qp_sum, qp_hero = await gather_all()
-        if not summary:
-            await event.send(event.plain_result("❌ 未找到玩家或资料未公开！"))
+            if not summary:
+                await event.send(event.plain_result("❌ 未找到玩家或资料未公开！"))
+                return
+
+            # 段位数据提取
+            competitive_data = summary.get("competitive", {})
+            logger.info(f"[OW段位调试] competitive原始数据: {json.dumps(competitive_data, ensure_ascii=False)}")
+            
+            # PC优先，无则用主机端数据
+            pc_data = competitive_data.get("pc", {})
+            console_data = competitive_data.get("console", {})
+            use_data = pc_data if pc_data else console_data
+            logger.info(f"[OW段位调试] 最终使用的段位数据: {json.dumps(use_data, ensure_ascii=False)}")
+
+            role_lines, season_lines = [], []
+            # 遍历三角色（核心修改3：强制显示所有角色，中文名称）
+            for role in ["tank", "damage", "support"]:
+                # 处理API返回的null（转为空字典）
+                role_info = use_data.get(role) or {}
+                logger.info(f"[OW段位调试] {role}角色数据: {json.dumps(role_info, ensure_ascii=False)}")
+                
+                # 角色名转为中文
+                role_cn = ROLE_CN[role]
+                
+                # 提取段位（division + tier），无论是否有数据都显示角色
+                div = role_info.get("division")
+                tier = role_info.get("tier")
+                # 调用div_to_sr，未定级时会返回"未定级"
+                role_lines.append(f"{role_cn}: {div_to_sr(div, tier)}")
+                
+                # 上赛季段位（仅当有数据时添加）
+                if (comp_sum is None or comp_sum.get("general", {}).get("games_played", 0) == 0) and role_info.get("season") and div and tier is not None:
+                    season_lines.append(
+                        f"{role_cn}: {div_to_sr(div, tier)} (S{role_info['season']})"
+                    )
+            
+            season_hint = f"📌 上赛季段位 | {' | '.join(season_lines)}\n" if season_lines else ""
+
+            # 竞技模式数据
+            if comp_sum and comp_sum.get("general", {}).get("games_played", 0):
+                comp_block = format_mode(comp_sum["general"], "竞技")
+            else:
+                comp_block = "【竞技】\n暂无数据"
+
+            # 快速模式数据
+            if qp_sum and qp_sum.get("general", {}).get("games_played", 0):
+                qp_block = "\n\n" + format_mode(qp_sum["general"], "快速")
+            else:
+                qp_block = "\n\n【快速】\n暂无数据"
+
+            # 组装消息
+            msg = (
+                f"【{tag}】亚服 OW2 全数据\n"
+                f"🏆 当前段位 | {' | '.join(role_lines)}\n"
+                f"{season_hint}"
+                f"{comp_block}{qp_block}"
+            )
+            await event.send(event.plain_result(msg))
+
+        except Exception as e:
+            logger.error(f"[OW查询异常] {type(e).__name__}: {e}", exc_info=True)
+            await event.send(event.plain_result("❌ 查询异常，请稍后重试"))
             return
 
-        pc = (summary.get("competitive") or {}).get("pc") or {}
-        role_lines, season_lines = [], []
-        for r in ["tank", "damage", "support"]:
-            info = pc.get(r)
-            if info:
-                role_lines.append(f"{r.capitalize()}: {div_to_sr(info.get('division'), info.get('tier'))}")
-                # 本赛季无场次 → 显示上赛季
-                if (comp_sum is None or comp_sum.get("general", {}).get("games_played", 0) == 0) and info.get("season"):
-                    season_lines.append(
-                        f"{r.capitalize()}: {div_to_sr(info.get('division'), info.get('tier'))} (S{info['season']})"
-                    )
-        season_hint = f"📌 上赛季段位 | {' | '.join(season_lines)}\n" if season_lines else ""
-
-        # 竞技
-        if comp_sum and comp_sum.get("general", {}).get("games_played", 0):
-            comp_block = format_mode(comp_sum["general"], comp_hero.get("heroes", []) if comp_hero else [], "竞技")
-        else:
-            comp_block = "【竞技】\n暂无数据"
-
-        # 快速
-        if qp_sum and qp_sum.get("general", {}).get("games_played", 0):
-            qp_block = "\n\n" + format_mode(qp_sum["general"], qp_hero.get("heroes", []) if qp_hero else [], "快速")
-        else:
-            qp_block = "\n\n【快速】\n暂无数据"
-
-        msg = (
-            f"【{tag}】亚服 OW2 全数据\n"
-            f"🏆 当前段位 | {' | '.join(role_lines)}\n"
-            f"{season_hint}"
-            f"{comp_block}{qp_block}"
-        )
-        await event.send(event.plain_result(msg))
-
+    # ---- 其他命令保留 ----
     @filter.command("ow绑定")
     async def ow_bind(self, event: AstrMessageEvent):
         arg = event.message_str.strip().removeprefix("ow绑定").strip()
@@ -303,8 +310,7 @@ class OWStatsPlugin(Star):
             "2. /ow绑定 玩家#12345 – 绑定自己\n"
             "3. /ow – 查已绑定账号\n"
             "4. /ow解绑\n"
-            "5. /ow帮助\n\n"
-            "竞技数据立即返回，快速数据后台补发~"
+            "5. /ow帮助"
         )
 
     @filter.command("ow状态")
@@ -315,7 +321,7 @@ class OWStatsPlugin(Star):
             f"🔧 插件状态\n"
             f"API 连通: {'✅' if ok else '❌'}\n"
             f"已绑定: {total} 人\n"
-            f"版本: v1.1.0"
+            f"版本: v1.1.1"
         )
 
     async def terminate(self):
