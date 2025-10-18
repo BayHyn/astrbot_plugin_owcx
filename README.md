@@ -57,68 +57,6 @@ pip install -r requirements.txt
 | `/ow帮助` | 显示帮助信息 | `/ow帮助` |
 | `/ow状态` | 显示插件状态 | `/ow状态` |
 
-### 使用示例
-
-1. **首次使用**
-```
-用户: /ow绑定 Tracer#12345
-Bot: ✅ 绑定成功！
-    战网标签: Tracer#12345
-    现在您可以直接使用 /ow 查询战绩了！
-```
-
-2. **查询战绩**
-```
-用户: /ow
-Bot: 正在查询 Tracer#12345 的战绩...
-
-Bot: 【Tracer】亚服 OW2 战绩查询
-    等级: 567
-    🏆 最高SR
-    坦克: 2450 (铂金) | 输出: 3200 (钻石) | 辅助: 1800 (黄金)
-    总游戏时长: 156小时
-```
-
-3. **查询其他玩家**
-```
-用户: /ow Mercy#54321
-Bot: 【Mercy】亚服 OW2 战绩查询
-    等级: 423
-    🏆 最高SR
-    坦克: 2100 (黄金) | 输出: 1650 (白银) | 辅助: 3800 (大师)
-    总游戏时长: 203小时
-```
-
-## ⚙️ 配置说明
-
-插件配置文件位于 `data/ow_config.json`，可配置项包括：
-
-### API配置
-```json
-{
-  "api_base": "https://overfast-api.tekrop.fr",
-  "timeout": 10,
-  "max_retries": 3
-}
-```
-
-### 缓存配置
-```json
-{
-  "enable_cache": true,
-  "cache_ttl": 300,
-  "max_cache_size": 1000
-}
-```
-
-### 功能配置
-```json
-{
-  "enable_detailed_stats": true,
-  "show_level": true,
-  "show_playtime": true
-}
-```
 
 ## 🔧 故障排除
 
