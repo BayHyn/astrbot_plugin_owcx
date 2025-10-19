@@ -3,7 +3,7 @@
 
 🎮 **守望先锋战绩查询插件**
 
-[![Version](https://img.shields.io/badge/version-v2.0.0-blue.svg)](https://github.com/TZYCeng/astrbot_plugin_owcx)
+[![Version](https://img.shields.io/badge/version-v1.1.1-blue.svg)](https://github.com/TZYCeng/astrbot_plugin_owcx)
 [![Python](https://img.shields.io/badge/python-3.8+-green.svg)](https://www.python.org/)
 [![AstrBot](https://img.shields.io/badge/AstrBot-3.0+-orange.svg)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
