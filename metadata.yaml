@@ -1,5 +1,5 @@
 name: astrbot_plugin_owcx # 这是你的插件的唯一识别名。
-desc: 国际服《守望先锋 2》战绩查询插件，支持绑定战网Tag # 插件简短描述
-version: v1.1.1 # 插件版本号。格式：v1.1.1 或者 v1.1
+desc: 国际服守望先锋·归来查询插件，支持绑定战网Tag，单英雄查询等 # 插件简短描述
+version: v1.2.1 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: TZYCeng # 作者
 repo: https://github.com/TZYCeng/astrbot_plugin_owcx # 插件的仓库地址
