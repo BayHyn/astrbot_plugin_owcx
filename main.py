@@ -563,7 +563,7 @@ class OWStatsPlugin(Star):
     async def ow_help(self, event: AstrMessageEvent):
         """显示帮助信息（默认休闲模式）"""
         help_msg = (
-            f"🎮 守望先锋2 亚服战绩查询插件（v2.2.1）\n"
+            f"🎮 守望先锋2 亚服战绩查询插件（v1.2.1）\n"
             f"==============================\n"
             f"📌 说明：默认查询{DEFAULT_MODE_CN}模式，可显式指定“竞技”切换\n"
             f"🔍 基础查询：\n"
