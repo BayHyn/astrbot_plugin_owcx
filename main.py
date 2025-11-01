@@ -47,7 +47,7 @@ HERO_NAME_TO_KEY = {
     "生命之梭": "lifeweaver","伊拉锐": "illari","毛加": "mauga",
     "探奇": "venture","黑百合": "widowmaker","末日铁拳": "doomfist",
     "秩序之光": "symmetra","索杰恩": "sojourn","骇灾": "hazard","无漾": "wuyang",
-    "卡西迪": "cassidy","弗蕾娅": "freya","朱诺": "juno"
+    "弗蕾娅": "freya","朱诺": "juno"
 }
 # 模式映射（默认休闲）
 MODE_CN_TO_EN = {"竞技": "competitive", "休闲": "quickplay"}
@@ -598,7 +598,7 @@ class OWStatsPlugin(Star):
             f"API 连通性: {api_status}\n"
             f"已绑定账号: {len(self.bind_data)} 个\n"
             f"缓存数据量: {self.client.cache.size()} 条\n"
-            f"插件版本: v2.2.1\n"
+            f"插件版本: v1.2.1\n"
             f"默认模式: {DEFAULT_MODE_CN}（英雄查询默认）\n"
             f"超时配置: 60秒（减少超时概率）\n"
             f"支持功能: 基础战绩查询、英雄数据查询（竞技+休闲）\n"
