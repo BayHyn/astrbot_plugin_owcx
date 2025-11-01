@@ -1,20 +1,68 @@
 from astrbot.api.star import Star, register
 from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event.filter import PermissionType
 from astrbot.api import logger
 import aiohttp
 import asyncio
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import time
+from astrbot.api.message_components import Plain
 
-# ---------- 工具 ----------
+# ---------- 常量定义 ----------
+OW_API = "https://overfast-api.tekrop.fr"
+# 段位分数范围映射
+DIVISION_SCORE = {
+    "bronze": "1-1499", "silver": "1500-1999", "gold": "2000-2499",
+    "platinum": "2500-2999", "diamond": "3000-3499", "master": "3500-3999",
+    "grandmaster": "4000+"
+}
+# 角色名中英文映射
+ROLE_CN = {"tank": "坦克", "damage": "输出", "support": "支援"}
+# 段位中英文映射
+DIVISION_CN = {
+    "bronze": "青铜", "silver": "白银", "gold": "黄金",
+    "platinum": "白金", "diamond": "钻石", "master": "大师",
+    "grandmaster": "宗师"
+}
+# 缓存TTL配置（秒）
+CACHE_TTL = {
+    "summary": 600,    # 玩家概要：10分钟
+    "comp_summary": 600,# 竞技统计：10分钟
+    "qp_summary": 600, # 快速（休闲）统计：10分钟
+    "hero_stats": 3600 # 英雄数据：1小时
+}
+# 英雄名-Key映射（扩展可支持更多英雄）
+HERO_NAME_TO_KEY = {
+    "源氏": "genji","麦克雷": "cassidy","士兵76": "soldier-76",
+    "法老之鹰": "pharah","死神": "reaper","猎空": "tracer","温斯顿": "winston",
+    "查莉娅": "zarya","莱因哈特": "reinhardt","安娜": "ana","天使": "mercy",
+    "卢西奥": "lucio","半藏": "hanzo","狂鼠": "junkrat","路霸": "roadhog",
+    "D.Va": "dva","奥丽莎": "orisa","西格玛": "sigma","布里吉塔": "brigitte",
+    "莫伊拉": "moira","巴蒂斯特": "baptiste","黑影": "sombra",
+    "托比昂": "torbjorn","堡垒": "bastion","美": "mei","艾什": "ashe",
+    "破坏球": "wrecking-ball","禅雅塔": "zenyatta","回声": "echo",
+    "渣客女王": "junker-queen","雾子": "kiriko","拉玛刹": "ramattra",
+    "生命之梭": "lifeweaver","伊拉锐": "illari","毛加": "mauga",
+    "探奇": "venture","黑百合": "widowmaker","末日铁拳": "doomfist",
+    "秩序之光": "symmetra","索杰恩": "sojourn","骇灾": "hazard","无漾": "wuyang",
+    "卡西迪": "cassidy","弗蕾娅": "freya","朱诺": "juno"
+}
+# 模式映射（默认休闲）
+MODE_CN_TO_EN = {"竞技": "competitive", "休闲": "quickplay"}
+MODE_EN_TO_CN = {"competitive": "竞技", "quickplay": "休闲"}
+DEFAULT_MODE = "quickplay"  # 默认模式：休闲
+DEFAULT_MODE_CN = "休闲"    # 默认模式中文显示
+
+# ---------- 工具类 ----------
 class TimedCache:
-    def __init__(self, ttl: int = 600):
-        self.ttl = ttl
+    """带TTL的缓存类"""
+    def __init__(self):
         self._data: Dict[str, tuple] = {}
 
     def get(self, key: str) -> Optional[Any]:
+        """获取缓存，过期自动删除"""
         if key not in self._data:
             return None
         expire, value = self._data[key]
@@ -23,13 +71,25 @@ class TimedCache:
             return None
         return value
 
-    def set(self, key: str, value: Any):
-        self._data[key] = (time.time() + self.ttl, value)
+    def set(self, key: str, value: Any, ttl: int):
+        """设置缓存"""
+        self._data[key] = (time.time() + ttl, value)
 
+    def clear(self, pattern: Optional[str] = None):
+        """清理缓存，支持模糊匹配"""
+        if not pattern:
+            self._data.clear()
+            return
+        keys_to_remove = [k for k in self._data.keys() if pattern in k]
+        for key in keys_to_remove:
+            self._data.pop(key, None)
 
-# ---------- 全局限流器 ----------
+    def size(self) -> int:
+        """获取缓存大小"""
+        return len(self._data)
+
 class RateLimiter:
-    """令牌桶 + 429 冻结"""
+    """令牌桶限流 + 429冻结机制"""
     def __init__(self, rate: float = 1.0, burst: int = 3):
         self._rate = rate
         self._burst = burst
@@ -39,6 +99,7 @@ class RateLimiter:
         self._lock = asyncio.Lock()
 
     async def acquire(self, timeout: float = 35) -> bool:
+        """获取令牌，超时返回False"""
         async with self._lock:
             while True:
                 now = time.time()
@@ -58,273 +119,543 @@ class RateLimiter:
                 timeout -= sleep_for
 
     def freeze(self, seconds: int):
+        """冻结指定秒数"""
         self._freeze_until = max(self._freeze_until, time.time() + seconds)
 
-
-# ---------- API ----------
-OW_API = "https://overfast-api.tekrop.fr"
-
-
+# ---------- API客户端（修复resp异常+超时优化） ----------
 class OWAPIClient:
-    limiter = RateLimiter(rate=1.0, burst=3)
-
-    def __init__(self, timeout: int = 35, max_retries: int = 3):
+    """守望先锋API客户端（默认休闲模式）"""
+    def __init__(self, timeout: int = 60, max_retries: int = 3):  # 超时延长到60秒
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries
-        self.cache = TimedCache(ttl=600)
+        self.limiter = RateLimiter(rate=1.0, burst=3)
+        self.cache = TimedCache()
 
-    async def _get(self, url: str, timeout: int = 35, silent: bool = False) -> Optional[Dict[str, Any]]:
-        if self.cache.get(url):
-            return self.cache.get(url)
+    async def _get(self, url: str, ttl: int, timeout: int = 60) -> Tuple[Optional[Dict[str, Any]], str]:
+        """基础请求方法，修复resp未赋值+超时优化"""
+        cached_data = self.cache.get(url)
+        resp = None  # 提前初始化resp，避免未赋值引用
         deadline = time.time() + timeout
-        for attempt in range(1, self.max_retries + 1):
+        max_attempts = self.max_retries + 1  # 500错误多1次重试
+
+        for attempt in range(1, max_attempts + 1):
+            # 获取限流令牌
             ok = await self.limiter.acquire(timeout=deadline - time.time())
             if not ok:
-                logger.warning("[OWAPI] 全局等待超时，放弃请求")
-                return None
+                if cached_data:
+                    logger.warning(f"[OWAPI] 请求超时，返回缓存数据: {url}")
+                    return cached_data, ""
+                return None, "请求超时，当前查询人数过多或服务器响应慢"
+
             try:
                 async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                    async with session.get(url) as resp:
-                        if not silent:
-                            logger.info(f"[OWAPI] {url} -> {resp.status}")
+                    async with session.get(url) as resp:  # resp仅在此处赋值
+                        logger.info(f"[OWAPI] 请求: {url} | 状态码: {resp.status}")
+
+                        # 成功响应
                         if resp.status == 200:
                             data = await resp.json()
-                            self.cache.set(url, data)
-                            return data
-                        if resp.status == 404:
-                            logger.debug(f"[OWAPI] 404 无数据: {url}")
-                            return None
-                        if resp.status == 429:
+                            self.cache.set(url, data, ttl)
+                            return data, ""
+                        # 404无数据
+                        elif resp.status == 404:
+                            return None, "未找到该玩家或玩家资料未公开"
+                        # 429限流
+                        elif resp.status == 429:
                             retry_after = int(resp.headers.get("Retry-After", 5))
-                            logger.warning(f"[OWAPI] 429 限流，冻结 {retry_after}s")
                             self.limiter.freeze(retry_after)
+                            return None, f"查询过于频繁，请{retry_after}秒后再试"
+                        # 500错误处理
+                        elif resp.status == 500:
+                            logger.error(f"[OWAPI] 服务器内部错误（500）: {url} | 尝试{attempt}/{max_attempts}")
+                            if attempt == max_attempts:
+                                if cached_data:
+                                    logger.warning(f"[OWAPI] 500错误，返回缓存数据: {url}")
+                                    return cached_data, ""
+                                return None, "服务器暂时无法处理请求（可能是数据同步故障），建议1分钟后重试"
+                            await asyncio.sleep(3)
                             continue
-                        logger.warning(f"[OWAPI] 非 200/404/429: {resp.status}")
+                        # 其他错误
+                        else:
+                            return None, f"服务器请求异常（状态码: {resp.status}），请稍后重试"
+
             except asyncio.TimeoutError:
-                logger.warning(f"[OWAPI] 请求超时（尝试{attempt}）| url={url}")
+                logger.warning(f"[OWAPI] 超时（尝试{attempt}/{max_attempts}）: {url}")
+                # 超时后直接重试，不访问resp（此时resp为None）
+                backoff = 2 ** attempt
+                if time.time() + backoff >= deadline:
+                    break
+                await asyncio.sleep(backoff)
+                continue
             except Exception as e:
-                logger.error(f"[OWAPI] 请求异常（尝试{attempt}）: {type(e).__name__}: {e} | url={url}")
-            backoff = 2 **attempt
-            if time.time() + backoff >= deadline:
-                logger.warning("[OWAPI] 剩余时间不足，放弃重试")
-                break
-            await asyncio.sleep(backoff)
+                logger.error(f"[OWAPI] 异常（尝试{attempt}/{max_attempts}）: {str(e)} | url={url}")
+                # 其他异常也不访问resp，直接重试
+                backoff = 2 ** attempt
+                if time.time() + backoff >= deadline:
+                    break
+                await asyncio.sleep(backoff)
+                continue
+
+            # 仅当resp存在且非500错误时，执行普通退避（避免resp为None的情况）
+            if resp and resp.status != 500:
+                backoff = 2 ** attempt
+                if time.time() + backoff >= deadline:
+                    break
+                await asyncio.sleep(backoff)
+
+        # 所有尝试失败，返回缓存（若有）
+        if cached_data:
+            logger.warning(f"[OWAPI] 所有尝试失败，返回缓存数据: {url}")
+            return cached_data, ""
+        return None, "请求失败（可能是服务器超时或故障），建议稍后重试"
+
+    def _format_tag(self, tag: str) -> str:
+        """格式化玩家标签（#替换为-）"""
+        return tag.replace("#", "-")
+
+    async def get_summary(self, tag: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """获取玩家概要信息（段位等）"""
+        formatted_tag = self._format_tag(tag)
+        url = f"{OW_API}/players/{formatted_tag}/summary"
+        return await self._get(url, CACHE_TTL["summary"])
+
+    async def get_mode_summary(self, tag: str, gamemode: str) -> Tuple[Optional[Dict[str, Any]], str]:
+        """获取指定模式的统计信息"""
+        formatted_tag = self._format_tag(tag)
+        url = f"{OW_API}/players/{formatted_tag}/stats/summary?gamemode={gamemode}"
+        ttl_key = "comp_summary" if gamemode == "competitive" else "qp_summary"
+        return await self._get(url, CACHE_TTL[ttl_key])
+
+    async def get_hero_stats(self, tag: str, hero_key: str, gamemode: str = DEFAULT_MODE) -> Tuple[Optional[Dict[str, Any]], str]:
+        """获取指定英雄的详细数据（默认休闲模式）"""
+        formatted_tag = self._format_tag(tag)
+        url = f"{OW_API}/players/{formatted_tag}/stats/career?gamemode={gamemode}&hero={hero_key}"
+        return await self._get(url, CACHE_TTL["hero_stats"])
+
+    def search_hero_key(self, hero_name: str) -> Optional[str]:
+        """根据英雄中文名查找hero_key（不区分大小写）"""
+        hero_name_lower = hero_name.strip().lower()
+        for name, key in HERO_NAME_TO_KEY.items():
+            if name.lower() == hero_name_lower or key == hero_name_lower:
+                return key
         return None
 
-    # 核心接口
-    async def get_summary(self, tag: str) -> Optional[Dict[str, Any]]:
-        url = f"{OW_API}/players/{tag.replace('#', '-')}/summary"
-        return await self._get(url, timeout=8)
+# ---------- 格式化工具 ----------
+class FormatTool:
+    """数据格式化工具类（默认休闲模式）"""
+    @staticmethod
+    def format_division(div: Optional[str], tier: Optional[int]) -> str:
+        """格式化段位显示（含分数范围）"""
+        if not div or tier is None:
+            return "未定级"
+        cn_name = DIVISION_CN.get(div, div.upper())
+        score_range = DIVISION_SCORE.get(div, "未知分数")
+        return f"{cn_name} {tier} ({score_range}分)"
 
-    async def get_comp_summary(self, tag: str) -> Optional[Dict[str, Any]]:
-        url = f"{OW_API}/players/{tag.replace('#', '-')}/stats/summary?gamemode=competitive"
-        return await self._get(url, timeout=10, silent=True)
+    @staticmethod
+    def format_duration(sec: int) -> str:
+        """格式化时长（秒转时分）"""
+        h, m = divmod(sec // 60, 60)
+        return f"{h}小时{m}分钟"
 
-    async def get_qp_summary(self, tag: str) -> Optional[Dict[str, Any]]:
-        url = f"{OW_API}/players/{tag.replace('#', '-')}/stats/summary?gamemode=quickplay"
-        return await self._get(url, timeout=10, silent=True)
+    @staticmethod
+    def format_mode_stats(general: Dict[str, Any], mode_name: str) -> str:
+        """格式化模式统计数据"""
+        gp = general.get("games_played", 0)
+        gw = general.get("games_won", 0)
+        gl = gp - gw
+        wr = (gw / gp * 100) if gp else 0.0
+        kda = general.get("kda", 0)
+        avg = general.get("average", {}) or {}
+        
+        return (
+            f"【{mode_name}模式】\n"
+            f"📊 总场次: {gp} | 胜: {gw} | 负: {gl} | 胜率: {wr:.1f}%\n"
+            f"🎯 综合KD: {kda:.2f}\n"
+            f"⚔️ 每10分钟平均:\n"
+            f"　消灭: {avg.get('eliminations', 0):.1f} | "
+            f"死亡: {avg.get('deaths', 0):.1f}\n"
+            f"　伤害: {avg.get('damage', 0):.0f} | "
+            f"治疗: {avg.get('healing', 0):.0f}"
+        )
 
+    @staticmethod
+    def format_hero_stats(hero_data: Dict[str, Any], hero_name: str, hero_key: str, gamemode_cn: str) -> str:
+        """格式化英雄详细数据（标注模式）"""
+        hero_stats = hero_data.get(hero_key, {}) or {}
+        combat = hero_stats.get("combat", {}) or {}
+        average = hero_stats.get("average", {}) or {}
+        best = hero_stats.get("best", {}) or {}
+        game = hero_stats.get("game", {}) or {}
+        
+        total_games = game.get("games_played", 0)
+        games_won = game.get("games_won", 0)
+        win_rate = (games_won / total_games * 100) if total_games > 0 else 0.0
+        total_elim = combat.get("eliminations", 0)
+        total_damage = combat.get("hero_damage_done", 0)
+        total_deaths = combat.get("deaths", 0)
+        total_final_blows = combat.get("final_blows", 0)
+        avg_elim = average.get("eliminations_avg_per_10_min", 0)
+        avg_damage = average.get("hero_damage_done_avg_per_10_min", 0)
+        avg_deaths = average.get("deaths_avg_per_10_min", 0)
+        avg_final_blows = average.get("final_blows_avg_per_10_min", 0)
+        best_elim = best.get("eliminations_most_in_game", 0)
+        best_streak = best.get("kill_streak_best", 0)
+        best_damage = best.get("hero_damage_done_most_in_game", 0)
+        best_multikill = best.get("multikill_best", 0)
+        
+        return (
+            f"【{hero_name} {gamemode_cn}模式数据】\n"
+            f"📊 总场次: {total_games} | 胜场: {games_won} | 胜率: {win_rate:.1f}%\n"
+            f"⚔️ 战斗统计:\n"
+            f"　总消灭: {total_elim} | 总伤害: {total_damage:.0f}\n"
+            f"　总死亡: {total_deaths} | 总最终一击: {total_final_blows}\n"
+            f"🎯 每10分钟平均:\n"
+            f"　消灭: {avg_elim:.1f} | 伤害: {avg_damage:.0f}\n"
+            f"　死亡: {avg_deaths:.1f} | 最终一击: {avg_final_blows:.1f}\n"
+            f"🏆 最佳表现:\n"
+            f"　单局最高消灭: {best_elim} | 最长连杀: {best_streak}\n"
+            f"　单局最高伤害: {best_damage:.0f} | 最佳多杀: {best_multikill}"
+        )
 
-# ---------- 插件 ----------
-DIVISION_CN = {
-    "bronze": "青铜", "silver": "白银", "gold": "黄金",
-    "platinum": "白金", "diamond": "钻石", "master": "大师",
-    "grandmaster": "宗师"
-}
-
-# 角色名中英文映射（核心修改1）
-ROLE_CN = {
-    "tank": "坦克",
-    "damage": "输出",
-    "support": "支援"
-}
-
-def div_to_sr(div: Optional[str], tier: Optional[int]) -> str:
-    if not div or tier is None:
-        return "未定级"  # 核心修改2：未定级时明确显示
-    cn = DIVISION_CN.get(div, div.upper())
-    return f"{cn} {tier}"
-
-def fmt_duration(sec: int) -> str:
-    h, m = divmod(sec // 60, 60)
-    return f"{h}h{m}m"
-
-# 模式数据格式化
-def format_mode(general: Dict[str, Any], mode_name: str) -> str:
-    gp = general.get("games_played", 0)
-    gw = general.get("games_won", 0)
-    gl = gp - gw
-    wr = (gw / gp * 100) if gp else 0.0
-    kd = general.get("kda", 0)
-    avg = general.get("average", {})
-    elim_avg = avg.get("eliminations", 0)
-    death_avg = avg.get("deaths", 0)
-    dmg_avg = avg.get("damage", 0)
-    heal_avg = avg.get("healing", 0)
-
-    return (
-        f"【{mode_name}】\n"
-        f"📊 总场次 {gp}  胜 {gw}  负 {gl}  胜率 {wr:.1f}%  综合KD {kd:.2f}\n"
-        f"🎯 平均数据（每10min）\n"
-        f"　消灭 {elim_avg:.1f}  死亡 {death_avg:.1f}  "
-        f"伤害 {dmg_avg:.0f}  治疗 {heal_avg:.0f}"
-    )
-
-
-@register("astrbot_plugin_owcx", "tzyc", "亚服 OW2 全数据查询", "v1.1.1")
+# ---------- 插件主类（默认休闲模式） ----------
+@register("astrbot_plugin_owcx", "tzyc", "国际服 OW2 数据查询", "v1.2.1")
 class OWStatsPlugin(Star):
     def __init__(self,** kwargs):
         super().__init__(kwargs.get("context"))
         self.client = OWAPIClient()
+        self.format_tool = FormatTool()
+        # 绑定文件管理
         self.bind_file = Path("data/ow_stats_bind.json")
         self.bind_file.parent.mkdir(parents=True, exist_ok=True)
-        self.bind = self._load_bind()
+        self.bind_data = self._load_bind_data()
 
-    # ---- 绑定 ----
-    def _load_bind(self) -> Dict[str, str]:
+    # ---------- 绑定数据管理 ----------
+    def _load_bind_data(self) -> Dict[str, str]:
+        """加载绑定数据"""
         if self.bind_file.exists():
             try:
                 return json.loads(self.bind_file.read_text(encoding="utf-8"))
             except Exception as e:
-                logger.error(f"加载绑定失败: {e}")
+                logger.error(f"加载绑定数据失败: {str(e)}")
         return {}
 
-    def _save_bind(self, data: Dict[str, str]):
+    def _save_bind_data(self):
+        """保存绑定数据"""
         try:
-            self.bind_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            logger.error(f"保存绑定失败: {e}")
-
-    # ---- 命令（核心修改：角色名中文 + 强制显示所有角色）----
-    @filter.command("ow")
-    async def ow_stats(self, event: AstrMessageEvent):
-        arg = event.message_str.strip().removeprefix("ow").strip()
-        qq = str(event.get_sender_id())
-        tag = arg or self.bind.get(qq)
-        if not tag:
-            yield event.plain_result("请先绑定：/ow绑定 玩家#12345\n或直接查询：/ow 玩家#12345")
-            return
-        if "#" not in tag:
-            yield event.plain_result("格式错误！示例：玩家#12345")
-            return
-
-        yield event.plain_result(f"正在查询 {tag} ...")
-
-        try:
-            summary_task = self.client.get_summary(tag)
-            comp_sum_task = self.client.get_comp_summary(tag)
-            qp_sum_task = self.client.get_qp_summary(tag)
-            summary, comp_sum, qp_sum = await asyncio.gather(summary_task, comp_sum_task, qp_sum_task)
-
-            if not summary:
-                await event.send(event.plain_result("❌ 未找到玩家或资料未公开！"))
-                return
-
-            # 段位数据提取
-            competitive_data = summary.get("competitive", {})
-            logger.info(f"[OW段位调试] competitive原始数据: {json.dumps(competitive_data, ensure_ascii=False)}")
-            
-            # PC优先，无则用主机端数据
-            pc_data = competitive_data.get("pc", {})
-            console_data = competitive_data.get("console", {})
-            use_data = pc_data if pc_data else console_data
-            logger.info(f"[OW段位调试] 最终使用的段位数据: {json.dumps(use_data, ensure_ascii=False)}")
-
-            role_lines, season_lines = [], []
-            # 遍历三角色（核心修改3：强制显示所有角色，中文名称）
-            for role in ["tank", "damage", "support"]:
-                # 处理API返回的null（转为空字典）
-                role_info = use_data.get(role) or {}
-                logger.info(f"[OW段位调试] {role}角色数据: {json.dumps(role_info, ensure_ascii=False)}")
-                
-                # 角色名转为中文
-                role_cn = ROLE_CN[role]
-                
-                # 提取段位（division + tier），无论是否有数据都显示角色
-                div = role_info.get("division")
-                tier = role_info.get("tier")
-                # 调用div_to_sr，未定级时会返回"未定级"
-                role_lines.append(f"{role_cn}: {div_to_sr(div, tier)}")
-                
-                # 上赛季段位（仅当有数据时添加）
-                if (comp_sum is None or comp_sum.get("general", {}).get("games_played", 0) == 0) and role_info.get("season") and div and tier is not None:
-                    season_lines.append(
-                        f"{role_cn}: {div_to_sr(div, tier)} (S{role_info['season']})"
-                    )
-            
-            season_hint = f"📌 上赛季段位 | {' | '.join(season_lines)}\n" if season_lines else ""
-
-            # 竞技模式数据
-            if comp_sum and comp_sum.get("general", {}).get("games_played", 0):
-                comp_block = format_mode(comp_sum["general"], "竞技")
-            else:
-                comp_block = "【竞技】\n暂无数据"
-
-            # 快速模式数据
-            if qp_sum and qp_sum.get("general", {}).get("games_played", 0):
-                qp_block = "\n\n" + format_mode(qp_sum["general"], "快速")
-            else:
-                qp_block = "\n\n【快速】\n暂无数据"
-
-            # 组装消息
-            msg = (
-                f"【{tag}】亚服 OW2 全数据\n"
-                f"🏆 当前段位 | {' | '.join(role_lines)}\n"
-                f"{season_hint}"
-                f"{comp_block}{qp_block}"
+            self.bind_file.write_text(
+                json.dumps(self.bind_data, ensure_ascii=False, indent=2),
+                encoding="utf-8"
             )
-            await event.send(event.plain_result(msg))
-
         except Exception as e:
-            logger.error(f"[OW查询异常] {type(e).__name__}: {e}", exc_info=True)
-            await event.send(event.plain_result("❌ 查询异常，请稍后重试"))
-            return
+            logger.error(f"保存绑定数据失败: {str(e)}")
 
-    # ---- 其他命令保留 ----
+    # ---------- 核心命令（默认休闲模式） ----------
+    @filter.command("ow")
+    async def ow_stats_query(self, event: AstrMessageEvent):
+        """战绩查询主命令（含竞技+休闲）"""
+        args = event.message_str.strip().removeprefix("ow").strip().split()
+        qq = str(event.get_sender_id())
+        tag = ""
+        platform = "pc"  # 默认PC平台
+        
+        # 解析参数
+        if len(args) == 0:
+            tag = self.bind_data.get(qq)
+            if not tag:
+                yield event.plain_result("请先绑定账号或直接查询：\n/ow 玩家#12345 [pc/console]")
+                return
+        elif len(args) == 1:
+            tag = args[0]
+        elif len(args) == 2 and args[1] in ["pc", "console"]:
+            tag = args[0]
+            platform = args[1]
+        else:
+            yield event.plain_result("参数格式错误！\n正确格式：/ow 玩家#12345 [pc/console]")
+            return
+        
+        if "#" not in tag:
+            yield event.plain_result("玩家标签格式错误！\n示例：/ow 玩家#12345")
+            return
+        
+        yield event.plain_result(f"🔍 正在查询 {tag}（{platform}平台）...")
+        
+        try:
+            # 并行请求竞技+休闲数据
+            summary_task = self.client.get_summary(tag)
+            comp_task = self.client.get_mode_summary(tag, "competitive")
+            qp_task = self.client.get_mode_summary(tag, "quickplay")
+            
+            summary, summary_err = await summary_task
+            comp_stats, comp_err = await comp_task
+            qp_stats, qp_err = await qp_task
+            
+            if summary_err:
+                yield event.plain_result(f"❌ {summary_err}")
+                return
+            
+            # 解析段位+格式化数据
+            role_lines = self._parse_division_data(summary, platform)
+            season_hint = self._get_season_hint(summary, platform, comp_stats)
+            comp_block = self._format_mode_block(comp_stats, comp_err, "竞技")
+            qp_block = self._format_mode_block(qp_stats, qp_err, "休闲")
+            
+            result_msg = (
+                f"🏆 【{tag}】亚服 OW2 战绩汇总\n"
+                f"📱 平台: {'电脑端' if platform == 'pc' else '主机端'}\n"
+                f"段位信息 | {' | '.join(role_lines)}\n"
+                f"{season_hint}\n"
+                f"{comp_block}\n\n{qp_block}"
+            )
+            
+            yield event.plain_result(result_msg)
+            
+        except Exception as e:
+            logger.error(f"查询异常: {str(e)}", exc_info=True)
+            yield event.plain_result("❌ 查询异常，请稍后重试")
+
+    @filter.command("ow英雄")
+    async def ow_hero_stats(self, event: AstrMessageEvent):
+        """英雄详细数据查询（默认休闲模式+错误优化）"""
+        args = event.message_str.strip().removeprefix("ow英雄").strip().split()
+        qq = str(event.get_sender_id())
+        tag = ""
+        hero_name = ""
+        gamemode = DEFAULT_MODE
+        gamemode_cn = DEFAULT_MODE_CN
+
+        # 步骤1：解析模式参数
+        if len(args) >= 1 and args[-1] in MODE_CN_TO_EN.keys():
+            gamemode = MODE_CN_TO_EN[args[-1]]
+            gamemode_cn = args[-1]
+            args = args[:-1]
+
+        # 步骤2：解析英雄名和玩家标签
+        if len(args) >= 2 and "#" in args[-1]:
+            hero_name = " ".join(args[:-1])
+            tag = args[-1]
+        elif len(args) == 1:
+            hero_name = args[0]
+            tag = self.bind_data.get(qq)
+            if not tag:
+                yield event.plain_result(
+                    f"请先绑定账号或指定查询：\n"
+                    f"1. 已绑定：/ow英雄 英雄名 [竞技/休闲]（默认{DEFAULT_MODE_CN}）\n"
+                    f"2. 未绑定：/ow英雄 英雄名 玩家#12345 [竞技/休闲]"
+                )
+                return
+        else:
+            yield event.plain_result(
+                "参数格式错误！\n正确格式：\n"
+                f"1. 已绑定：/ow英雄 英雄名 [竞技/休闲]（默认{DEFAULT_MODE_CN}）\n"
+                f"2. 未绑定：/ow英雄 英雄名 玩家#12345 [竞技/休闲]\n"
+                f"示例：/ow英雄 源氏（默认休闲）| /ow英雄 源氏 竞技"
+            )
+            return
+        
+        # 步骤3：查找英雄key
+        hero_key = self.client.search_hero_key(hero_name)
+        if not hero_key:
+            yield event.plain_result(f"❌ 未找到英雄：{hero_name}\n支持英雄：{', '.join(HERO_NAME_TO_KEY.keys())}")
+            return
+        
+        # 步骤4：请求数据
+        logger.info(f"[OW英雄查询] tag={tag}, hero={hero_name}, mode={gamemode_cn}")
+        yield event.plain_result(f"🔍 正在查询 {tag} 的 {hero_name} {gamemode_cn}模式数据...")
+        hero_data, err_msg = await self.client.get_hero_stats(tag, hero_key, gamemode)
+        
+        # 步骤5：错误处理（区分超时和其他错误）
+        if err_msg:
+            # 超时场景提示优化
+            if "请求超时" in err_msg:
+                err_msg += f"\n💡 提示：服务器响应较慢，可1分钟后再试，或切换竞技模式（/ow英雄 {hero_name} 竞技）"
+            elif gamemode == "quickplay" and "服务器暂时无法处理请求" in err_msg:
+                err_msg += f"\n💡 备选方案：尝试查询 {hero_name} 竞技模式，命令：/ow英雄 {hero_name} 竞技"
+            logger.error(f"[OW英雄查询失败] tag={tag}, hero={hero_name}, mode={gamemode_cn} | 错误: {err_msg}")
+            yield event.plain_result(f"❌ {err_msg}")
+            return
+        if not hero_data:
+            empty_msg = f"❌ 未查询到 {hero_name} 的 {gamemode_cn}模式数据"
+            if gamemode == "quickplay":
+                empty_msg += f"\n💡 可尝试查询竞技模式：/ow英雄 {hero_name} 竞技"
+            yield event.plain_result(empty_msg)
+            return
+        
+        # 步骤6：数据判空与格式化
+        hero_specific_data = hero_data.get(hero_key, {}) or {}
+        game_stats = hero_specific_data.get("game", {}) or {}
+        total_games = game_stats.get("games_played", 0)
+        combat_stats = hero_specific_data.get("combat", {}) or {}
+        has_combat_data = any(key in combat_stats for key in ["eliminations", "hero_damage_done"])
+        
+        if total_games == 0 and not has_combat_data:
+            no_data_msg = (
+                f"✅ API请求成功（状态码200）\n"
+                f"❌ {tag} 未使用 {hero_name} 参与{gamemode_cn}模式对战\n"
+                f"（提示：场次为0，无战斗数据）"
+            )
+            if gamemode == "quickplay":
+                no_data_msg += f"\n💡 可尝试查询竞技模式：/ow英雄 {hero_name} 竞技"
+            yield event.plain_result(no_data_msg)
+            return
+        elif total_games > 0 and not has_combat_data:
+            yield event.plain_result(
+                f"✅ API请求成功（状态码200）\n"
+                f"⚠️ {tag} 使用 {hero_name} 参与{total_games}场{gamemode_cn}模式对战\n"
+                f"❌ 暂未获取到该英雄的战斗数据（可能数据未同步）"
+            )
+            return
+        
+        # 步骤7：输出结果
+        hero_msg = self.format_tool.format_hero_stats(hero_data, hero_name, hero_key, gamemode_cn)
+        yield event.plain_result(hero_msg)
+
+    # ---------- 绑定管理命令 ----------
     @filter.command("ow绑定")
-    async def ow_bind(self, event: AstrMessageEvent):
+    async def ow_bind_account(self, event: AstrMessageEvent):
+        """绑定玩家账号（提示默认休闲）"""
         arg = event.message_str.strip().removeprefix("ow绑定").strip()
         qq = str(event.get_sender_id())
+        
         if not arg or "#" not in arg:
-            yield event.plain_result("格式：/ow绑定 玩家#12345")
+            yield event.plain_result("绑定格式错误！\n正确格式：/ow绑定 玩家#12345")
             return
-        self.bind[qq] = arg
-        self._save_bind(self.bind)
-        yield event.plain_result(f"✅ 已绑定 {arg}\n现在可直接用 /ow 查询")
+        
+        self.bind_data[qq] = arg
+        self._save_bind_data()
+        yield event.plain_result(
+            f"✅ 成功绑定账号：{arg}\n"
+            f"📌 后续查询默认{DEFAULT_MODE_CN}模式：\n"
+            f"　- 查战绩：/ow\n"
+            f"　- 查英雄：/ow英雄 英雄名（如/ow英雄 源氏）\n"
+            f"　- 查竞技：/ow英雄 英雄名 竞技"
+        )
 
     @filter.command("ow解绑")
-    async def ow_unbind(self, event: AstrMessageEvent):
+    async def ow_unbind_account(self, event: AstrMessageEvent):
+        """解绑玩家账号"""
         qq = str(event.get_sender_id())
-        old = self.bind.pop(qq, None)
-        if old:
-            self._save_bind(self.bind)
-            yield event.plain_result(f"✅ 已解绑 {old}")
-        else:
-            yield event.plain_result("您还未绑定")
+        if qq not in self.bind_data:
+            yield event.plain_result("❌ 您尚未绑定任何账号")
+            return
+        
+        old_tag = self.bind_data.pop(qq)
+        self._save_bind_data()
+        yield event.plain_result(f"✅ 成功解绑账号：{old_tag}")
 
+    # ---------- 管理员专属命令 ----------
+    @filter.command("ow清理缓存")
+    @filter.permission_type(PermissionType.ADMIN)
+    async def ow_clear_cache(self, event: AstrMessageEvent):
+        """清理缓存（仅管理员）"""
+        args = event.message_str.strip().removeprefix("ow清理缓存").strip()
+        cache_size = self.client.cache.size()
+        
+        if args == "全部":
+            self.client.cache.clear()
+            yield event.plain_result(f"✅ 已清理全部缓存（共{cache_size}条）")
+        else:
+            self.client.cache.clear("players")
+            yield event.plain_result(f"✅ 已清理玩家数据缓存（共{cache_size}条）")
+
+    # ---------- 帮助与状态命令 ----------
     @filter.command("ow帮助")
     async def ow_help(self, event: AstrMessageEvent):
-        yield event.plain_result(
-            "🎮 亚服 OW2 全数据命令\n"
-            "1. /ow 玩家#12345  – 直接查别人\n"
-            "2. /ow绑定 玩家#12345 – 绑定自己\n"
-            "3. /ow – 查已绑定账号\n"
-            "4. /ow解绑\n"
-            "5. /ow帮助"
+        """显示帮助信息（默认休闲模式）"""
+        help_msg = (
+            f"🎮 守望先锋2 亚服战绩查询插件（v2.2.1）\n"
+            f"==============================\n"
+            f"📌 说明：默认查询{DEFAULT_MODE_CN}模式，可显式指定“竞技”切换\n"
+            f"🔍 基础查询：\n"
+            f"  /ow 玩家#12345 [pc/console] - 查指定玩家战绩（含竞技+休闲）\n"
+            f"  /ow - 查已绑定账号战绩\n"
+            f"\n"
+            f"🦸 英雄查询（默认{DEFAULT_MODE_CN}）：\n"
+            f"  1. 已绑定账号：/ow英雄 英雄名 [竞技/休闲]\n"
+            f"     示例：/ow英雄 源氏（默认休闲）| /ow英雄 源氏 竞技\n"
+            f"  2. 未绑定账号：/ow英雄 英雄名 玩家#12345 [竞技/休闲]\n"
+            f"     示例：/ow英雄 安娜 玩家#12345 休闲\n"
+            f"\n"
+            f"🔧 账号管理：\n"
+            f"  /ow绑定 玩家#12345 - 绑定账号\n"
+            f"  /ow解绑 - 解绑账号\n"
+            f"\n"
+            f"💡 管理员命令：\n"
+            f"  /ow清理缓存 [全部] - 清理查询缓存\n"
+            f"📌 提示：若{DEFAULT_MODE_CN}模式超时，可延长等待或切换竞技模式"
         )
+        yield event.plain_result(help_msg)
 
     @filter.command("ow状态")
     async def ow_status(self, event: AstrMessageEvent):
-        total = len(self.bind)
-        ok = await self.client.get_summary("TeKrop-2217") is not None
-        yield event.plain_result(
-            f"🔧 插件状态\n"
-            f"API 连通: {'✅' if ok else '❌'}\n"
-            f"已绑定: {total} 人\n"
-            f"版本: v1.1.1"
+        """显示插件状态（默认模式标注）"""
+        test_data, _ = await self.client.get_summary("TeKrop-2217")
+        api_status = "✅ 正常" if test_data else "❌ 异常"
+        
+        status_msg = (
+            "🔧 守望先锋插件状态\n"
+            "==================\n"
+            f"API 连通性: {api_status}\n"
+            f"已绑定账号: {len(self.bind_data)} 个\n"
+            f"缓存数据量: {self.client.cache.size()} 条\n"
+            f"插件版本: v2.2.1\n"
+            f"默认模式: {DEFAULT_MODE_CN}（英雄查询默认）\n"
+            f"超时配置: 60秒（减少超时概率）\n"
+            f"支持功能: 基础战绩查询、英雄数据查询（竞技+休闲）\n"
+            f"支持英雄数: {len(HERO_NAME_TO_KEY)} 个"
         )
+        yield event.plain_result(status_msg)
+
+    # ---------- 内部工具方法 ----------
+    def _parse_division_data(self, summary: Dict[str, Any], platform: str) -> List[str]:
+        """解析段位数据（双重判空）"""
+        competitive = summary.get("competitive", {}) or {}
+        platform_data = competitive.get(platform, {}) or {}
+        
+        role_lines = []
+        for role in ["tank", "damage", "support"]:
+            role_data = platform_data.get(role, {}) or {}
+            div = role_data.get("division")
+            tier = role_data.get("tier")
+            role_cn = ROLE_CN[role]
+            role_lines.append(f"{role_cn}: {self.format_tool.format_division(div, tier)}")
+        
+        return role_lines
+
+    def _get_season_hint(self, summary: Dict[str, Any], platform: str, comp_stats: Optional[Dict[str, Any]]) -> str:
+        """获取上赛季段位提示"""
+        competitive = summary.get("competitive", {}) or {}
+        platform_data = competitive.get(platform, {}) or {}
+        
+        season_lines = []
+        comp_gp = comp_stats.get("general", {}).get("games_played", 0) if (comp_stats and comp_stats.get("general")) else 0
+        if comp_gp == 0:
+            for role in ["tank", "damage", "support"]:
+                role_data = platform_data.get(role, {}) or {}
+                if role_data.get("season") and role_data.get("division") and role_data.get("tier") is not None:
+                    div = role_data["division"]
+                    tier = role_data["tier"]
+                    season = role_data["season"]
+                    role_cn = ROLE_CN[role]
+                    season_lines.append(f"{role_cn}: {self.format_tool.format_division(div, tier)} (S{season})")
+        
+        return f"📌 上赛季段位 | {' | '.join(season_lines)}\n" if season_lines else ""
+
+    def _format_mode_block(self, stats: Optional[Dict[str, Any]], err_msg: str, mode_name: str) -> str:
+        """格式化模式数据块"""
+        if err_msg:
+            return f"【{mode_name}模式】\n❌ {err_msg}"
+        if not stats:
+            return f"【{mode_name}模式】\n📊 暂无对战数据"
+        general_stats = stats.get("general", {}) or {}
+        total_games = general_stats.get("games_played", 0)
+        if total_games == 0:
+            return f"【{mode_name}模式】\n📊 未参与过该模式对战"
+        
+        return self.format_tool.format_mode_stats(general_stats, mode_name)
 
     async def terminate(self):
-        logger.info("OW 插件卸载，保存绑定...")
-        self._save_bind(self.bind)
-        logger.info("OW 插件已卸载")
+        """插件卸载时保存数据"""
+        logger.info("OW2插件正在卸载，保存绑定数据...")
+        self._save_bind_data()
+        logger.info("OW2插件卸载完成")
